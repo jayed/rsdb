@@ -4,46 +4,24 @@ use std::ptr;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::Ordering::{SeqCst};
+
+use crossbeam::epoch::{pin, Atomic, Owned, Shared};
 
 use {raw, test_fail};
 
 pub struct Node<T> {
     inner: T,
-    next: *const Node<T>,
+    next: Atomic<Node<T>>,
 }
 
-#[derive(Clone)]
 pub struct Stack<T> {
-    head: Arc<AtomicPtr<Node<T>>>,
+    head: Atomic<Node<T>>,
 }
 
 impl<T> Default for Stack<T> {
     fn default() -> Stack<T> {
-        Stack { head: Arc::new(AtomicPtr::new(ptr::null_mut())) }
-    }
-}
-
-impl<T: Debug> Debug for Stack<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        let mut ptr = self.head();
-        formatter.write_str("Stack(").unwrap();
-        ptr.fmt(formatter).unwrap();
-        formatter.write_str(") [").unwrap();
-        let mut written = false;
-        while !ptr.is_null() {
-            if written {
-                formatter.write_str(", ").unwrap();
-            }
-            unsafe {
-                (*ptr).inner.fmt(formatter).unwrap();
-                ptr = (*ptr).next;
-            }
-            written = true;
-        }
-        formatter.write_str("]").unwrap();
-        Ok(())
+        Stack { head: Atomic::null() }
     }
 }
 
@@ -55,24 +33,17 @@ impl<T> Deref for Node<T> {
 }
 
 impl<T> Node<T> {
-    pub fn next(&self) -> *const Node<T> {
-        self.next
-    }
-}
-
-impl<T> Drop for Stack<T> {
-    fn drop(&mut self) {
-        let mut ptr = self.head();
-        while !ptr.is_null() {
-            let node: Box<Node<T>> = unsafe { Box::from_raw(ptr as *mut _) };
-            ptr = node.next;
-        }
+    pub fn next(&self) -> Option<Shared<Node<T>>> {
+        let guard = pin();
+        self.next.load(SeqCst, &guard)
     }
 }
 
 impl<T> Stack<T> {
-    pub fn from_raw(from: *const Node<T>) -> Stack<T> {
-        Stack { head: Arc::new(AtomicPtr::new(from as *mut Node<T>)) }
+    pub fn from_raw(from: Shared<Node<T>>) -> Stack<T> {
+        let head = Atomic::null();
+        head.store_shared(Some(from), SeqCst);
+        Stack { head: head }
     }
 
     pub fn from_vec(from: Vec<T>) -> Stack<T> {
@@ -86,34 +57,33 @@ impl<T> Stack<T> {
     }
 
     pub fn push(&self, inner: T) {
-        let mut head = self.head() as *mut _;
-        let mut node = Box::into_raw(Box::new(Node {
+        let node = Owned::new(Node {
             inner: inner,
-            next: head,
-        }));
+            next: Atomic::null(),
+        });
+
+        let guard = pin();
+
         loop {
-            let ret = self.head.compare_and_swap(head, node, Ordering::SeqCst);
-            if head == ret {
+            let head = self.head();
+            node.next.store_shared(head, SeqCst);
+            if self.head.cas(head, Some(node), SeqCst).is_ok() {
                 return;
-            }
-            head = ret;
-            unsafe {
-                (*node).next = head;
             }
         }
     }
 
     pub fn pop(&self) -> Option<T> {
+        let guard = pin();
         loop {
-            let head_ptr = self.head() as *mut _;
-            if head_ptr.is_null() {
+            let head = self.head();
+            if head.is_none() {
                 return None;
             }
-            let node: Box<Node<T>> = unsafe { Box::from_raw(head_ptr) };
-            let next_ptr = node.next;
+            let node = head.unwrap();
+            let next = node.next.load(SeqCst, &guard);
 
-            if head_ptr ==
-               self.head.compare_and_swap(head_ptr, next_ptr as *mut _, Ordering::SeqCst) {
+            if self.head.cas_shared(head, next, SeqCst) {
                 return Some(node.inner);
             } else {
                 mem::forget(node);
@@ -122,36 +92,39 @@ impl<T> Stack<T> {
     }
 
     pub fn pop_all(&self) -> Vec<T> {
-        let mut node_ptr = self.head.swap(ptr::null_mut(), Ordering::SeqCst);
         let mut res = vec![];
-        while !node_ptr.is_null() {
-            let node = unsafe { Box::from_raw(node_ptr) };
-            node_ptr = node.next as *mut _;
-            res.push(node.inner);
+        while let Some(elem) = self.pop() {
+            res.push(elem);
         }
         res
     }
 
     /// compare and push
-    pub fn cap(&self, old: *const Node<T>, new: T) -> Result<*const Node<T>, *const Node<T>> {
-        let node = Box::into_raw(Box::new(Node {
+    pub fn cap(&self, old: Option<Shared<Node<T>>>, new: T) -> Result<Option<Shared<Node<T>>>, Option<Shared<Node<T>>>> {
+        let node = Owned::new(Node {
             inner: new,
-            next: old,
-        }));
-        let res = self.head.compare_and_swap(old as *mut _, node as *mut _, Ordering::SeqCst);
+            next: Atomic::null(),
+        });
+
+        let guard = pin();
+
+        node.next.store_shared(old, SeqCst);
+
+        self.head.cas_and_ref(old, Some(node), SeqCst);
         if old == res && !test_fail() {
             Ok(node)
         } else {
-            Err(res)
+            // TODO refactor users to do this on their own if they really want it
+            self.head()
         }
     }
 
     /// attempt consolidation
     pub fn cas(&self,
-               old: *const Node<T>,
-               new: *const Node<T>)
-               -> Result<*const Node<T>, *const Node<T>> {
-        let res = self.head.compare_and_swap(old as *mut _, new as *mut _, Ordering::SeqCst);
+               old: Shared<Node<T>>,
+               new: Shared<Node<T>>)
+               -> Result<Shared<Node<T>>, Shared<Node<T>>> {
+        let res = self.head.compare_and_swap(old as *mut _, new as *mut _, SeqCst);
         if old == res && !test_fail() {
             Ok(new)
         } else {
@@ -171,8 +144,9 @@ impl<T> Stack<T> {
         })
     }
 
-    pub fn head(&self) -> *const Node<T> {
-        self.head.load(Ordering::Acquire)
+    pub fn head(&self) -> Option<Shared<Node<T>>> {
+        let guard = pin();
+        self.head.load(SeqCst, &guard)
     }
 
     pub fn len(&self) -> usize {
@@ -242,9 +216,29 @@ pub fn node_from_frag_vec<T>(from: Vec<T>) -> *const Node<T> {
     last
 }
 
+trait ActualAtomic {
+    fn compare_and_swap() {}
+}
+
+impl ActualAtomic for Atomic {
+fn cas_and_ref<'a>(&self, old: Option<Shared<T>>, new: Owned<T>,
+ord: Ordering, _: &'a Guard)
+-> Result<Shared<'a, T>, Owned<T>>
+{
+if self.ptr.compare_and_swap(opt_shared_into_raw(old), new.as_raw(), ord)
+== opt_shared_into_raw(old)
+{
+Ok(unsafe { Shared::from_owned(new) })
+} else {
+Err(new)
+}
+}
+}
+
 #[test]
 fn basic_functionality() {
     use std::thread;
+    use std::sync::Arc;
 
     let ll = Arc::new(Stack::default());
     assert_eq!(ll.pop(), None);

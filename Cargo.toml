@@ -9,6 +9,8 @@ keywords = ["database", "embedded", "concurrent", "persistent", "lock-free"]
 documentation = "https://docs.rs/rsdb/"
 
 [dependencies]
+rayon = "0.8"
+crossbeam = "0.3"
 bincode = "0.8"
 serde = "1.0"
 serde_derive = "1.0"
@@ -18,7 +20,6 @@ rand = "0.3"
 env_logger = "0.4"
 log = "0.3"
 num_cpus = "1.6"
-rayon = "0.8"
 tempfile = "2.1"
 zstd = "0.4"
 

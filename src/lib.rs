@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 
 extern crate libc;
+extern crate crossbeam;
 extern crate rayon;
 extern crate serde;
 #[macro_use]
