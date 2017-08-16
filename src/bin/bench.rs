@@ -2,6 +2,8 @@ extern crate clap;
 extern crate num_cpus;
 #[macro_use]
 extern crate log;
+extern crate rayon;
+extern crate rand;
 extern crate rsdb;
 
 use std::error::Error;
@@ -10,6 +12,10 @@ use std::process;
 use std::collections::HashMap;
 
 use clap::{App, Arg};
+use rayon::{Configuration, ThreadPool};
+use rand::Rng;
+
+use rsdb::Tree;
 
 fn main() {
     let cpus = &(num_cpus::get().to_string());
@@ -159,7 +165,86 @@ fn main() {
 
 fn run(config: Config) -> Result<(), Box<Error>> {
     println!("running benchmarking suite...");
+
+    // the thread pool we use to perform our operations on the tree
+    let pool = rayon::ThreadPool::new(rayon::Configuration::new().num_threads(config.num_threads))
+        .unwrap();
+
+    // create a default rsdb config
+    let rsdb_config = rsdb::Config::default();
+    let mut tree = rsdb_config.tree();
+
+    pool.install(|| perform_operations(&mut tree, config));
+
     Ok(())
+}
+
+fn perform_operations(tree: &mut Tree, config: Config) {
+    let sum_ops = config.set + config.scan + config.get + config.delete + config.cas;
+    let ops = vec![
+        (Op::Set, config.set),
+        (Op::Scan, config.scan),
+        (Op::Get, config.get),
+        (Op::Delete, config.delete),
+        (Op::Cas, config.cas),
+    ];
+    let operations = Vec::new();
+
+    for i in 0..config.num_operations {
+        println!("Performing operation: {}", i);
+        let op = get_operation_choice(&ops, sum_ops);
+
+        let operation = match op {
+            Some(Op::Set) => println!("Performing Set operation"), // returns closure for set operation
+            Some(Op::Scan) => println!("Performing Scan operation"), // returns closure for scan operation
+            _ => println!("Doing nothing"),
+        };
+
+        operations.push(operation);
+    }
+
+    rayon::join(operations); // join all the individual operation closures
+}
+
+fn get_operation_choice(ops: &Vec<(Op, usize)>, sum_ops: usize) -> Option<Op> {
+    let mut choice = rand::thread_rng().gen_range::<usize>(0, sum_ops);
+
+    for (op, weight) in ops {
+        if weight >= choice {
+            return Some(op);
+        }
+        choice -= weight;
+    }
+    return None;
+}
+
+/// Tree operations
+#[derive(Debug)]
+enum Op {
+    Set,
+    Scan,
+    Get,
+    Delete,
+    Cas,
+}
+
+/// Key-Value struct which contains the keys and values
+struct KV {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl KV {
+    /// creates a new Key-Value instance
+    fn new() -> KV {
+        // TODO key and value should be randomized
+        // TODO key should be 64 byte
+        // TODO value should be 512 byte
+        KV {
+            key: vec![42u8],
+            value: vec![4711u8],
+        }
+    }
 }
 
 /// Configuration which is passed in via CLI arguments
