@@ -1,203 +1,383 @@
-//! `rsdb` is a flash-sympathetic persistent lock-free B+ tree, pagecache, and log.
+//! `sled` is a high-performance embedded database with
+//! an API that is similar to a `BTreeMap<[u8], [u8]>`,
+//! but with several additional capabilities for
+//! assisting creators of stateful systems.
 //!
-//! # Tree
+//! It is fully thread-safe, and all operations are
+//! atomic. Multiple `Tree`s with isolated keyspaces
+//! are supported with the
+//! [`Db::open_tree`](struct.Db.html#method.open_tree) method.
+//!
+//! ACID transactions involving reads and writes to
+//! multiple items are supported with the
+//! [`Tree::transaction`](struct.Tree.html#method.transaction)
+//! method. Transactions may also operate over
+//! multiple `Tree`s (see
+//! [`Tree::transaction`](struct.Tree.html#method.transaction)
+//! docs for more info).
+//!
+//! Users may also subscribe to updates on individual
+//! `Tree`s by using the
+//! [`Tree::watch_prefix`](struct.Tree.html#method.watch_prefix)
+//! method, which returns a blocking `Iterator` over
+//! updates to keys that begin with the provided
+//! prefix. You may supply an empty prefix to subscribe
+//! to everything.
+//!
+//! [Merge operators](https://github.com/spacejam/sled/wiki/merge-operators)
+//! (aka read-modify-write operators) are supported. A
+//! merge operator is a function that specifies
+//! how new data can be merged into an existing value
+//! without requiring both a read and a write.
+//! Using the
+//! [`Tree::merge`](struct.Tree.html#method.merge)
+//! method, you may "push" data to a `Tree` value
+//! and have the provided merge operator combine
+//! it with the existing value, if there was one.
+//! They are set on a per-`Tree` basis, and essentially
+//! allow any sort of data structure to be built
+//! using merges as an atomic high-level operation.
+//!
+//! `sled` is built by experienced database engineers
+//! who think users should spend less time tuning and
+//! working against high-friction APIs. Expect
+//! significant ergonomic and performance improvements
+//! over time. Most surprises are bugs, so please
+//! [let us know](mailto:t@jujit.su?subject=sled%20sucks!!!) if something
+//! is high friction.
+//!
+//! # Examples
 //!
 //! ```
-//! let t = rsdb::Config::default().tree();
+//! # let _ = std::fs::remove_dir_all("my_db");
+//! let t = sled::open("my_db").unwrap();
 //!
-//! t.set(b"yo!".to_vec(), b"v1".to_vec());
+//! // insert and get
+//! t.insert(b"yo!", b"v1");
+//! assert_eq!(&t.get(b"yo!").unwrap().unwrap(), b"v1");
 //!
-//! t.get(b"yo!");
+//! // Atomic compare-and-swap.
+//! t.compare_and_swap(
+//!     b"yo!",      // key
+//!     Some(b"v1"), // old value, None for not present
+//!     Some(b"v2"), // new value, None for delete
+//! )
+//! .unwrap();
 //!
-//! t.cas(b"yo!".to_vec(), Some(b"v1".to_vec()), Some(b"v2".to_vec())).unwrap();
-//!
-//! let mut iter = t.scan(b"a non-present key before yo!");
-//!
-//! assert_eq!(iter.next(), Some((b"yo!".to_vec(), b"v2".to_vec())));
+//! // Iterates over key-value pairs, starting at the given key.
+//! let scan_key: &[u8] = b"a non-present key before yo!";
+//! let mut iter = t.range(scan_key..);
+//! assert_eq!(&iter.next().unwrap().unwrap().0, b"yo!");
 //! assert_eq!(iter.next(), None);
 //!
-//! t.del(b"yo!");
+//! t.remove(b"yo!");
+//! assert_eq!(t.get(b"yo!"), Ok(None));
+//! # let _ = std::fs::remove_dir_all("my_db");
 //! ```
-//!
-//! # Working with the `PageCache`
-//!
-//! ```
-//! extern crate rsdb;
-//!
-//! use rsdb::Materializer;
-//!
-//! pub struct TestMaterializer;
-//!
-//! impl Materializer for TestMaterializer {
-//!     type MaterializedPage = String;
-//!     type PartialPage = String;
-//!     type Recovery = ();
-//!
-//!     fn materialize(&self, frags: &[String]) -> String {
-//!         self.consolidate(frags).pop().unwrap()
-//!     }
-//!
-//!     fn consolidate(&self, frags: &[String]) -> Vec<String> {
-//!         let mut consolidated = String::new();
-//!         for frag in frags.into_iter() {
-//!             consolidated.push_str(&*frag);
-//!         }
-//!
-//!         vec![consolidated]
-//!     }
-//!
-//!     fn recover(&self, _: &String) -> Option<()> {
-//!         None
-//!     }
-//! }
-//!
-//! fn main() {
-//!     let path = "test_pagecache_doc.log";
-//!
-//!     let conf = rsdb::Config::default().path(Some(path.to_owned()));
-//!
-//!     let pc = rsdb::PageCache::new(TestMaterializer, conf.clone());
-//!
-//!     let (id, key) = pc.allocate();
-//!
-//!     // The first item in a page should be set using replace, which
-//!     // signals that this is the beginning of a new page history, and
-//!     // that any previous items associated with this page should be
-//!     // forgotten.
-//!     let key = pc.replace(id, key, vec!["a".to_owned()]).unwrap();
-//!
-//!     let key = pc.prepend(id, key, "b".to_owned()).unwrap();
-//!
-//!     let _key = pc.prepend(id, key, "c".to_owned()).unwrap();
-//!
-//!     let (consolidated, _) = pc.get(id).unwrap();
-//!
-//!     assert_eq!(consolidated, "abc".to_owned());
-//!
-//!     std::fs::remove_file(path).unwrap();
-//! }
-//! ```
-//!
-//! # Working with `Log`
-//!
-//! ```
-//! use rsdb::Log;
-//!
-//! let log = rsdb::Config::default().log();
-//! let first_offset = log.write(b"1".to_vec());
-//! log.write(b"22".to_vec());
-//! log.write(b"333".to_vec());
-//!
-//! // stick an abort in the middle, which should not be returned
-//! let res = log.reserve(b"never_gonna_hit_disk".to_vec());
-//! res.abort();
-//!
-//! log.write(b"4444".to_vec());
-//! let last_offset = log.write(b"55555".to_vec());
-//! log.make_stable(last_offset);
-//! let mut iter = log.iter_from(first_offset);
-//! assert_eq!(iter.next().unwrap().1, b"1".to_vec());
-//! assert_eq!(iter.next().unwrap().1, b"22".to_vec());
-//! assert_eq!(iter.next().unwrap().1, b"333".to_vec());
-//! assert_eq!(iter.next().unwrap().1, b"4444".to_vec());
-//! assert_eq!(iter.next().unwrap().1, b"55555".to_vec());
-//! assert_eq!(iter.next(), None);
-//! ```
-
-
-#![deny(missing_docs)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/spacejam/sled/master/art/tree_face_anti-transphobia.png"
+)]
 #![cfg_attr(test, deny(warnings))]
-#![cfg_attr(feature="clippy", feature(plugin))]
-#![cfg_attr(feature="clippy", plugin(clippy))]
-#![cfg_attr(feature="clippy", allow(inline_always))]
+#![deny(
+    missing_docs,
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    missing_copy_implementations,
+    trivial_casts,
+    trivial_numeric_casts,
+    unsafe_code,
+    unused_qualifications
+)]
+#![deny(
+    // over time, consider enabling the commented-out lints below
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::checked_conversions,
+    clippy::decimal_literal_representation,
+    clippy::doc_markdown,
+    // clippy::else_if_without_else,
+    clippy::empty_enum,
+    clippy::explicit_into_iter_loop,
+    clippy::explicit_iter_loop,
+    clippy::expl_impl_clone_on_copy,
+    clippy::fallible_impl_from,
+    clippy::filter_map,
+    clippy::filter_map_next,
+    clippy::find_map,
+    clippy::float_arithmetic,
+    clippy::get_unwrap,
+    clippy::if_not_else,
+    // clippy::indexing_slicing,
+    clippy::inline_always,
+    //clippy::integer_arithmetic,
+    clippy::invalid_upcast_comparisons,
+    clippy::items_after_statements,
+    clippy::map_flatten,
+    clippy::match_same_arms,
+    clippy::maybe_infinite_iter,
+    clippy::mem_forget,
+    // clippy::missing_const_for_fn,
+    // clippy::missing_docs_in_private_items,
+    clippy::module_name_repetitions,
+    clippy::multiple_crate_versions,
+    clippy::multiple_inherent_impl,
+    clippy::mut_mut,
+    clippy::needless_borrow,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::non_ascii_literal,
+    clippy::option_map_unwrap_or,
+    clippy::option_map_unwrap_or_else,
+    clippy::path_buf_push_overwrite,
+    clippy::print_stdout,
+    clippy::pub_enum_variant_names,
+    clippy::redundant_closure_for_method_calls,
+    clippy::replace_consts,
+    clippy::result_map_unwrap_or_else,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::single_match_else,
+    clippy::string_add,
+    clippy::string_add_assign,
+    clippy::type_repetition_in_bounds,
+    clippy::unicode_not_nfc,
+    // clippy::unimplemented,
+    clippy::unseparated_literal_suffix,
+    clippy::used_underscore_binding,
+    clippy::wildcard_dependencies,
+    // clippy::wildcard_enum_match_arm,
+    clippy::wrong_pub_self_convention,
+)]
+#![allow(clippy::mem_replace_with_default)] // Not using std::mem::take() due to MSRV of 1.37
+#![recursion_limit = "128"]
 
-extern crate libc;
-extern crate rayon;
-extern crate crossbeam;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate bincode;
-extern crate rand;
-#[macro_use]
-extern crate log as logger;
-extern crate tempfile;
-extern crate zstd;
-extern crate time;
-extern crate glob;
-
-/// atomic lock-free tree
-pub use tree::Tree;
-/// lock-free pagecache
-pub use page::{Materializer, PageCache};
-/// lock-free log-structured storage
-pub use log::{HEADER_LEN, LockFreeLog, Log, LogRead};
-/// lock-free stack
-use stack::Stack;
-/// lock-free radix tree
-pub use radix::Radix;
-/// general-purpose configuration
-pub use config::Config;
-
-use crc16::crc16_arr;
-
-macro_rules! rep_no_copy {
-    ($e:expr; $n:expr) => {
+macro_rules! io_fail {
+    ($config:expr, $e:expr) => {
+        #[cfg(feature = "failpoints")]
         {
-            let mut v = Vec::with_capacity($n);
-            for _ in 0..$n {
-                v.push($e);
+            if fail::is_active($e) {
+                $config.set_global_error(Error::FailPoint);
+                return Err(Error::FailPoint).into();
             }
-            v
         }
     };
 }
 
-#[cfg(test)]
-fn test_fail() -> bool {
-    use rand::Rng;
-    rand::thread_rng().gen::<bool>();
-    // TODO when the time is right, return the gen'd bool
-    false
+macro_rules! testing_assert {
+    ($($e:expr),*) => {
+        #[cfg(feature = "lock_free_delays")]
+        assert!($($e),*)
+    };
 }
 
-#[cfg(not(test))]
-#[inline(always)]
-fn test_fail() -> bool {
-    false
-}
-
-mod tree;
-mod bound;
-mod log;
-mod crc16;
-mod crc64;
-mod stack;
-mod page;
-mod radix;
+mod batch;
+mod binary_search;
+mod concurrency_control;
 mod config;
-mod thread_cache;
+mod context;
+mod db;
+mod dll;
+mod fastcmp;
+mod fastlock;
+mod histogram;
+mod iter;
+mod ivec;
+mod lazy;
+mod lru;
+mod meta;
+mod metrics;
+mod node;
+mod oneshot;
+mod pagecache;
+mod prefix;
+mod result;
+mod serialization;
+mod stack;
+mod stackvec;
+mod subscriber;
+mod sys_limits;
+pub mod transaction;
+mod tree;
 
-use bound::Bound;
-use page::CacheEntry;
-use stack::{StackIter, node_from_frag_vec};
-use thread_cache::ThreadCache;
+/// Functionality for conditionally triggering failpoints under test.
+#[cfg(feature = "failpoints")]
+pub mod fail;
 
-type LogID = u64; // LogID == file position to simplify file mapping
-type PageID = usize;
+#[cfg(feature = "docs")]
+pub mod doc;
 
-type Key = Vec<u8>;
-type KeyRef<'a> = &'a [u8];
-type Value = Vec<u8>;
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+mod threadpool {
+    use super::OneShot;
 
-#[inline(always)]
-fn raw<T>(t: T) -> *const T {
-    Box::into_raw(Box::new(t)) as *const T
+    /// Just execute a task without involving threads.
+    pub fn spawn<F, R>(work: F) -> OneShot<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (promise_filler, promise) = OneShot::pair();
+        promise_filler.fill((work)());
+        return promise;
+    }
 }
 
-// get thread identifier
-#[inline(always)]
-fn tn() -> String {
-    use std::thread;
-    thread::current().name().unwrap_or("unknown").to_owned()
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+mod threadpool;
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+mod flusher;
+
+#[cfg(feature = "event_log")]
+/// The event log helps debug concurrency issues.
+pub mod event_log;
+
+#[cfg(feature = "measure_allocs")]
+mod measure_allocs;
+
+#[cfg(feature = "measure_allocs")]
+#[global_allocator]
+static ALLOCATOR: measure_allocs::TrackingAllocator =
+    measure_allocs::TrackingAllocator;
+
+const DEFAULT_TREE_ID: &[u8] = b"__sled__default";
+
+/// hidden re-export of items for testing purposes
+#[doc(hidden)]
+pub use {
+    self::{
+        config::RunningConfig,
+        lazy::Lazy,
+        pagecache::{
+            constants::{
+                MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION,
+                MINIMUM_ITEMS_PER_SEGMENT, SEG_HEADER_LEN,
+            },
+            BatchManifest, DiskPtr, Log, LogKind, LogOffset, LogRead, Lsn,
+            PageCache, PageId,
+        },
+        serialization::Serialize,
+    },
+    crossbeam_epoch::{pin, Atomic, Guard, Owned, Shared},
+};
+
+pub use self::{
+    batch::Batch,
+    config::{Config, Mode},
+    db::{open, Db},
+    iter::Iter,
+    ivec::IVec,
+    result::{Error, Result},
+    subscriber::{Event, Subscriber},
+    transaction::Transactional,
+    tree::{CompareAndSwapError, Tree},
+};
+
+use {
+    self::{
+        binary_search::binary_search_lub,
+        concurrency_control::{ConcurrencyControl, Protector},
+        context::Context,
+        fastcmp::fastcmp,
+        histogram::Histogram,
+        lru::Lru,
+        meta::Meta,
+        metrics::{clock, Measure, M},
+        node::{Data, Node},
+        oneshot::{OneShot, OneShotFiller},
+        result::CasResult,
+        stackvec::StackVec,
+        subscriber::Subscribers,
+        tree::TreeInner,
+    },
+    crossbeam_utils::{Backoff, CachePadded},
+    log::{debug, error, trace, warn},
+    pagecache::RecoveryGuard,
+    parking_lot::{Condvar, Mutex, RwLock},
+    std::{
+        collections::BTreeMap,
+        convert::TryFrom,
+        fmt::{self, Debug},
+        io::{Read, Write},
+        sync::{
+            atomic::{
+                AtomicI64 as AtomicLsn, AtomicU64, AtomicUsize,
+                Ordering::{Acquire, Relaxed, Release, SeqCst},
+            },
+            Arc,
+        },
+    },
+};
+
+fn crc32(buf: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(buf);
+    hasher.finalize()
+}
+
+fn calculate_message_crc32(header: &[u8], body: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    hasher.update(&header[4..]);
+    let crc32 = hasher.finalize();
+    crc32 ^ 0xFFFF_FFFF
+}
+
+#[cfg(any(test, feature = "lock_free_delays"))]
+mod debug_delay;
+
+#[cfg(any(test, feature = "lock_free_delays"))]
+use debug_delay::debug_delay;
+
+/// This function is useful for inducing random jitter into our atomic
+/// operations, shaking out more possible interleavings quickly. It gets
+/// fully eliminated by the compiler in non-test code.
+#[cfg(not(any(test, feature = "lock_free_delays")))]
+const fn debug_delay() {}
+
+/// Link denotes a tree node or its modification fragment such as
+/// key addition or removal.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Link {
+    /// A new value is set for a given key
+    Set(IVec, IVec),
+    /// The associated value is removed for a given key
+    Del(IVec),
+    /// A child of this Index node is marked as mergable
+    ParentMergeIntention(PageId),
+    /// The merging child has been completely merged into its left sibling
+    ParentMergeConfirm,
+    /// A Node is marked for being merged into its left sibling
+    ChildMergeCap,
+}
+
+/// A fast map that is not resistant to collision attacks. Works
+/// on 8 bytes at a time.
+pub(crate) type FastMap8<K, V> = std::collections::HashMap<
+    K,
+    V,
+    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
+>;
+
+/// A fast set that is not resistant to collision attacks. Works
+/// on 8 bytes at a time.
+pub(crate) type FastSet8<V> = std::collections::HashSet<
+    V,
+    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
+>;
+
+/// Allows arbitrary logic to be injected into mere operations of the
+/// `PageCache`.
+pub trait MergeOperator:
+    Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
+{
+}
+impl<F> MergeOperator for F where
+    F: Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
+{
 }
